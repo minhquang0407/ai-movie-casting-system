@@ -50,7 +50,7 @@ if __name__ == "__main__":
     mock_title = "The Matrix: Resurrections"
     mock_actors = [
         {"id": 111, "name": "Keanu Reeves"},
-        {"id": 222, "name": "Carrie-Anne Moss"}
+        {"id": 222, "name": "Carrie-Anne Moss"},
     ]
 
     print("=== KHỞI ĐỘNG CỖ MÁY NẠP ĐỒ THỊ ===")
