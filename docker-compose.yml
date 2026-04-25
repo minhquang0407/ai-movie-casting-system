@@ -1,0 +1,79 @@
+version: '3.8'
+
+services:
+  # ==========================================
+  # 1. TẦNG DATA LAKE (MINIO)
+  # ==========================================
+  minio:
+    image: minio/minio:latest
+    container_name: casting_minio
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    environment:
+      - MINIO_ROOT_USER=admin
+      - MINIO_ROOT_PASSWORD=AdminSecretKey123!
+    command: server /data --console-address ":9001"
+    volumes:
+      - minio_data:/data
+
+  # ==========================================
+  # 2. TẦNG GRAPH DATABASE (NEO4J)
+  # ==========================================
+  neo4j:
+    image: neo4j:5.12.0
+    container_name: casting_neo4j
+    ports:
+      - "7474:7474"
+      - "7687:7687"
+    environment:
+      - NEO4J_AUTH=neo4j/Neo4jSuperSecret456!
+      - NEO4J_db_tx__log_rotation_retention__policy=1 days
+    volumes:
+      - neo4j_data:/data
+    # [THÊM MỚI] BÁC SĨ KIỂM TRA SỨC KHỎE NEO4J
+    healthcheck:
+      # Gõ cửa cổng 7474 liên tục, nếu trả lời mới tính là sống
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:7474 || exit 1"]
+      interval: 10s       # Cứ 10 giây kiểm tra 1 lần
+      timeout: 5s         # Đợi tối đa 5 giây cho mỗi lần kiểm tra
+      retries: 5          # Thử tối đa 5 lần
+      start_period: 30s   # Cho Neo4j 30 giây đầu tiên để khởi động máy mà không bị tính là lỗi
+
+  # ==========================================
+  # 3. LÕI MICROSERVICE & AI (FASTAPI)
+  # ==========================================
+  api:
+    build: .
+    container_name: casting_api
+    ports:
+      - "8000:8000"
+    # [THÊM MỚI] CHỈ KHỞI ĐỘNG KHI NEO4J ĐÃ HEALTHY
+    depends_on:
+      neo4j:
+        condition: service_healthy
+    # [THÊM MỚI] TỰ ĐỘNG HỒI SINH NẾU BỊ SẬP BẤT NGỜ
+    restart: always
+    environment:
+      - NEO4J_URI=bolt://neo4j:7687
+      - NEO4J_USER=neo4j
+      - NEO4J_PASSWORD=Neo4jSuperSecret456!
+    command: uvicorn src.api.main:app --host 0.0.0.0 --port 8000
+
+  # ==========================================
+  # 4. GIAO DIỆN ĐẠO DIỄN (STREAMLIT)
+  # ==========================================
+  frontend:
+    build: .
+    container_name: casting_frontend
+    ports:
+      - "8501:8501"
+    # Frontend cũng phải chờ API thật sự khỏe mạnh (Tùy chọn nâng cao, ở đây chờ API bật là đủ)
+    depends_on:
+      - api
+    restart: always
+    command: streamlit run src/app.py --server.address 0.0.0.0
+
+volumes:
+  minio_data:
+  neo4j_data:

@@ -51,8 +51,8 @@ class TMDBExtractor:
         hwm_date = self._get_hwm()
         print(f"[INFO] Bắt đầu trích xuất từ HWM: {hwm_date}")
 
-        current_page = 1
-        total_pages = 1  # Giả định ban đầu
+        current_page = 315
+        total_pages = 1000  # Giả định ban đầu
         saved_records = 0
 
         headers = {
@@ -79,6 +79,7 @@ class TMDBExtractor:
             results = data.get("results", [])
 
             if not results:
+                print("[INFO] Đã lấy hết!")
                 break
 
             # Lưu dữ liệu thô vào MinIO (Data Lake)
@@ -106,32 +107,96 @@ class TMDBExtractor:
         self._update_hwm(datetime.now().strftime("%Y-%m-%d"))
         return saved_records
 
+    def extract_credits(self, target_month: str = None) -> int:
+        """
+        Luồng trích xuất Cạnh (Đạo diễn & Diễn viên) dựa trên Phim đã tải.
+        Giải quyết bài toán N+1 Queries với Token Bucket.
+        """
+        if not target_month:
+            target_month = datetime.now().strftime("%Y-%m")
+
+        prefix = f"raw/tmdb/{target_month}/movies_page_"
+        print(f"\n[INFO] Bắt đầu quét các bộ phim trong không gian: {prefix}")
+
+        movie_ids = set()
+
+        # 1. Quét không gian MinIO để thu thập ID phim
+        try:
+            objects = self.minio.list_objects(self.bucket_name, prefix=prefix, recursive=True)
+            for obj in objects:
+                response = self.minio.get_object(self.bucket_name, obj.object_name)
+                movies_data = json.loads(response.read().decode('utf-8'))
+                for movie in movies_data:
+                    movie_ids.add(movie["id"])
+        except Exception as e:
+            print(f"[ERROR] Lỗi khi đọc không gian MinIO: {e}")
+            return 0
+
+        total_movies = len(movie_ids)
+        print(f"[SUCCESS] Đã thu thập {total_movies} Đỉnh (Movies) cần tìm Cạnh (Credits).")
+
+        headers = {
+            "accept": "application/json",
+            "Authorization": f"Bearer {self.api_key}"
+        }
+
+        saved_credits = 0
+
+        # 2. Vòng lặp N+1 Queries để lấy Credits
+        for idx, movie_id in enumerate(movie_ids, 1):
+            url = f"{self.base_url}/movie/{movie_id}/credits"
+            object_name = f"raw/tmdb/{target_month}/credits_{movie_id}.json"
+
+            # Bỏ qua nếu đã tải rồi (Idempotency - Tính lũy đẳng)
+            try:
+                self.minio.stat_object(self.bucket_name, object_name)
+                print(f"[{idx}/{total_movies}] Bỏ qua phim {movie_id} (Đã tồn tại Credits).")
+                continue
+            except S3Error:
+                pass  # File chưa tồn tại, bắt đầu tải
+
+            response = requests.get(url, headers=headers)
+
+            # Xử lý Rate Limit cực hạn
+            while response.status_code == 429:
+                print(f"[WARNING] Rate Limit tại phim {movie_id}. Phạt lùi 5 giây...")
+                time.sleep(5.0)
+                response = requests.get(url, headers=headers)
+
+            if response.status_code != 200:
+                print(f"[ERROR] Bỏ qua phim {movie_id} do lỗi API: {response.status_code}")
+                continue
+
+            data = response.json()
+            raw_bytes = json.dumps(data).encode('utf-8')
+
+            # Lưu Đỉnh Dị thể và Cạnh vào MinIO
+            self.minio.put_object(
+                bucket_name=self.bucket_name,
+                object_name=object_name,
+                data=io.BytesIO(raw_bytes),
+                length=len(raw_bytes),
+                content_type="application/json"
+            )
+            saved_credits += 1
+            print(f"[{idx}/{total_movies}] Đã lưu Credits cho phim {movie_id}.")
+
+            # Toán tử trễ bảo vệ băng thông
+            time.sleep(0.25)
+
+        return saved_credits
 
 if __name__ == "__main__":
-    from dotenv import load_dotenv
+    from infrastructure.minio_client import MinioStorageClient  # Giả định đường dẫn của bạn
 
-    # 1. Tải các biến từ file .env vào không gian hệ điều hành
-    load_dotenv()
+    # 1. Khởi tạo Storage Client bằng Singleton
+    storage = MinioStorageClient()
+    minio_client = storage.get_client()
+    storage.ensure_bucket_exists("bronze")
 
+    # 2. Khởi tạo Extractor
     API_KEY = os.getenv("TMDB_API_KEY")
-    MINIO_USER = os.getenv("MINIO_USER")
-    MINIO_PASS = os.getenv("MINIO_PASSWORD")
+    extractor = TMDBExtractor(api_key=API_KEY, minio_client=minio_client)
 
-    if not API_KEY or API_KEY == "your_real_key_here":
-        print("[FATAL ERROR] Chưa cấu hình TMDB_API_KEY thật trong file .env!")
-        exit(1)
-
-    # 2. Khởi tạo kết nối tới MinIO Container (đang chạy ở cổng 9000)
-    client = Minio(
-        "localhost:9000",
-        access_key=MINIO_USER,
-        secret_key=MINIO_PASS,
-        secure=False
-    )
-
-    # 3. Kích hoạt cỗ máy trích xuất
-    extractor = TMDBExtractor(api_key=API_KEY, minio_client=client)
-
-    print("=== KHỞI ĐỘNG HỆ THỐNG TRÍCH XUẤT TMDB ===")
-    total = extractor.extract_recent_movies()
-    print(f"=== HOÀN TẤT: Đã tải về {total} bộ phim mới ===")
+    # 3. Chạy luồng
+    extractor.extract_credits()
